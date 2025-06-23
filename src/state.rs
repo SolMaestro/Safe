@@ -72,3 +72,56 @@ impl Pack for Vault {
     vault_token_account_dst.copy_from_slice(self.vault_token_account.as_ref());
   }
 }
+
+// Structure to hold a user's individual vault state
+pub struct UserVault {
+  pub is_initialized: bool,                 // Flag to check if the account has been initialized
+  pub user: Pubkey,                         // The public key of the depositor i.e the user
+  pub vault: Pubkey,                        // The vault this user is interacting with
+  pub deposited_amount: u64,                // Total amount this user has deposited
+}
+
+// Empty implementation of the Sealed trait, required to implement Pack
+impl Sealed for UserVault {}
+
+// Lets Solana programs check if the account is already initialized
+impl IsInitialized for UserVault {
+fn is_initialized(&self) -> bool {
+  self.is_initialized
+}
+}
+
+// Implement Pack so the struct can be serialized/deserialized into account data
+impl Pack for UserVault {
+  // The total size of the struct in bytes: 1 (bool) + 32 + 32 + 8 = 73 bytes
+  const LEN: usize = 1 + 32 + 32 + 8;
+
+  // Deserialize from raw byte slice into a UserVault struct
+  fn unpack_from_slice(src: &[u8]) -> Result<Self, solana_program::program_error::ProgramError> {
+    let src = array_ref![src, 0, UserVault::LEN];
+
+    // Split the byte slice into parts matching the field sizes
+    let (is_initialized, user, vault, deposited_amount) = array_refs![src, 1, 32, 32, 8];
+
+    Ok(UserVault{
+      is_initialized: is_initialized[0] != 0,                     // Convert byte to bool
+      user: Pubkey::new_from_array(*user),                        // Deserialize user pubkey
+      vault: Pubkey::new_from_array(*vault),                      // Deserialize vault pubkey
+      deposited_amount: u64::from_le_bytes(*deposited_amount),    // Convert 8 bytes to u64
+    })
+  }
+
+  // Serialize the struct back into a byte slice for writing to the account
+  fn pack_into_slice (&self, dst: &mut [u8]) {
+    let dst = array_mut_ref![dst, 0, UserVault::LEN];
+
+    // Split the destination slice into pieces for each field
+    let (is_initialized_dst, user_dst, vault_dst, deposited_amount_dst) = mut_array_refs![dst, 1, 32, 32, 8];
+
+     // Convert each field into bytes and write it
+    is_initialized_dst[0] = self.is_initialized as u8;
+    user_dst.copy_from_slice(self.user.as_ref());
+    vault_dst.copy_from_slice(self.vault.as_ref());
+    *deposited_amount_dst = self.deposited_amount.to_le_bytes();
+  }
+}
