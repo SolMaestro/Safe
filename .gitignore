@@ -1,0 +1,21 @@
+# === Rust & Cargo ===
+/target
+**/*.rs.bk
+Cargo.lock
+
+
+# === General build artifacts ===
+/dist/
+/out/
+
+# === VS Code & IDEs ===
+.vscode/
+.idea/
+*.log
+*.tmp
+*.swp
+
+# === Environment & secrets ===
+.env
+.env.*
+.env.local
