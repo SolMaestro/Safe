@@ -86,3 +86,175 @@ fn init_vault(program_id: &Pubkey, accounts: &[AccountInfo],) -> ProgramResult {
   Ok(())
 
 }
+
+fn deposit_tokens(
+  program_id: &Pubkey,                                 // Public key of the program
+  accounts: &[accounts],                                // The list of accounts passed to the instruction
+  amount: u64,                                          // The amount or number of tokens to deposit
+) -> ProgramResult {
+  // Create a mutable iterator over the accounts list so that each account can be processed in order
+  let account_info_iter = &mut accounts.iter();          
+
+  let depositor = next_account_info(account_info_iter)?;                    // The user initiating the deposit
+  let user_source_token_account = next_account_info(account_info_iter)?;    // The user's token account holding the tokens to be deposited
+  let vault_token_account = next_account_info(account_info_iter)?;          // The vault's token account where the tokens will be sent
+  let vault_state_account = next_account_info(account_info_iter)?;          // The account holding the vault's state/configuration data
+  let user_vault_account = next_account_info(account_info_iter)?;           // New PDA account
+  let token_program = next_account_info(account_info_iter)?;                // The SPL Token program required for token transfer
+
+  // Check that the depositor signed the transaction to prevent unauthorized access
+  if !depositor.is_signer {
+    return Err(ProgramError::MissingRequiredSignature);
+  }
+
+  // Deserialize the vault state account into a Vault struct
+  let mut vault = Vault::unpack(&vault_state_account.try_borrow_data()?)?;
+
+  // Safely increment the vault's total_deposits by the new deposit amount. `checked_add` protects against overflow; returns error if overflow would occur.
+  vault.total_deposits = vault.total_deposits.checked_add(amount).ok_or(ProgramError::InvalidInstructionData)?;
+
+  // Save (pack) the updated vault state back into the vault_state_account's data. `try_borrow_mut_data` ensures we're safely getting a mutable reference to the account's data.
+  Vault::pack(vault, &mut vault_state_account.try_borrow_mut_data()?)?;
+
+  // Derive the expected PDA for the user's vault account. Seeds for include "user_vault", depositor pubkey, and vault state pubkey.
+  // This ensures a unique address per user-vault combination and program.
+  let (expected_user_vault_pda, _bump) = Pubkey::find_program_address(
+    &[b"user_vault", depositor.key.as_ref(), vault_state_account.key.as_ref()],
+    program_id,
+  );
+
+  // Check if the derived PDA matches the actual provided user_vault_account. This ensures the user isn't trying to spoof a different PDA.
+  if expected_user_vault_pda != *user_vault_account.key {
+    return Err(ProgramError::InvalidAccountData);
+  }
+
+  // Handle initialization or loading of the user's vault data. If the user vault account is empty (first-time depositor), initialize it.
+  let mut user_vault_data = if user_vault_account.data_is_empty() {
+    UserVault {
+      is_initialized: true,
+      user: *depositor.key,
+      vault: *vault_state_account.key,
+      deposited_amount: 0,
+    }
+  } else {
+    // Otherwise, unpack the existing user vault data from the account.
+    UserVault::unpack(&user_vault_account.try_borrow_data()?)?
+  };
+  
+  // Build the SPL Token transfer instruction
+  // This will transfer `amount` tokens from the user's token account to the vault token account
+  let transfer_ix = spl_token::instruction::transfer(
+    token_program.key,                             // SPL Token program ID
+    user_source_token_account.key,                 // Source token account of user
+    vault_token_account.key,                       // Destination token account (vault's)
+    depositor.key,                                 // Authority account that must sign
+    &[],                                           // For implementing multi-signers (empty for now)
+    amount,                                        // Amount of tokens to deposit to vault
+  )?;
+
+  // Actually invoke the transfer instruction inside this program. This is a Cross-Program Invocation (CPI) to the Token program
+  invoke(
+    &transfer_ix,
+    &[
+      user_source_token_account.clone(),              // Source account
+      vault_token_account.clone(),                    // Destination account
+      depositor.clone(),                              // Authority account
+      token_program.clone(),                          // SPL Token program
+    ]
+  )?;
+
+  // Safely add the deposit amount to the user's personal deposited amount. As usual `checked_add` again avoids overflow and ensures safe arithmetic.
+  user_vault_data.deposited_amount = user_vault_data
+  .deposited_amount
+  .checked_add(amount)
+  .ok_or(ProgramError::InvalidInstructionData)?;
+
+  // Write (serialize) the updated user vault struct back into the user_vault_account data. This persists the updated user deposit to Solana storage.
+  UserVault::pack(user_vault_data, &mut user_vault_account.try_borrow_mut_data()?)?;
+
+  // Log a message indicating the deposit was successful plus the actual amount deposited
+  msg!("{} tokens deposited by {}", amount, depositor.key);
+
+  Ok(())
+}
+
+fn withdraw_tokens(program_id: &Pubkey, accounts: &[accounts], amount: u64) -> ProgramResult {
+  let account_info_iter = &mut accounts.iter();
+
+  let user = next_account_info(account_info_iter)?;
+  let vault_token_account = next_account_info(account_info_iter)?;
+  let user_destination_token_account = next_account_info(account_info_iter)?;
+  let vault_state = next_account_info(account_info_iter)?;
+  let user_vault_account = next_account_info(account_info_iter)?;
+  let token_program = next_account_info(account_info_iter)?;
+
+  if !user.is_signer {
+    return Err(ProgramError::MissingRequiredSignature);
+  }
+
+  // Load the current vault state from its account data
+  let mut vault = Vault::unpack(&vault_state_account.try_borrow_data()?)?;
+
+  // Safely subtract the withdrawal amount from the vault's total deposits. If the vault doesn’t have enough funds recorded, return an error
+  vault.total_deposits = vault.total_deposits.checked_sub(amount).ok_or(ProgramError::InsufficientFunds)?;
+
+  // Save the updated vault state back into the account data
+  Vault::pack(vault, &mut vault_state_account.try_borrow_mut_data()?)?;
+
+  // Recompute the expected PDA for the user's vault account using seeds. This ensures the client isn't passing in a spoofed or incorrect account
+  let (expected_pda, _bump) = Pubkey::find_program_address(
+    &[b"user_vault", user.key.as_ref(), vault_state_account.key.as_ref()],
+    program_id,
+  );
+
+  // Validate that the expected PDA matches the provided user vault account
+  if expected_pda != *user_vault_account.key {
+    return Err(ProgramError::InvalidAccountData);
+  }
+
+  // Load the user's vault record.
+  let mut user_vault = UserVault::unpack(&user_vault_account.try_borrow_data()?)?;
+
+  // Ensure the user has enough tokens deposited to withdraw the requested amount
+  if user_vault.deposited_amount < amount {
+    return Err(ProgramError::InsufficientFunds);
+  }
+
+  // Subtract the withdrawal amount from the user's deposited balance
+  user_vault.deposited_amount -= amount;
+
+  // Save the updated user state back into the user vault account
+  UserVault::pack(user_vault, &mut user_vault_account.try_borrow_mut_data()?)?;
+
+  // Derive the vault authority PDA, which will sign the token transfer.
+  let (vault_authority, bump_seed) = Pubkey::find_program_address(&[b"vault"], program_id);
+
+  // Prepare the signer seeds used for invoke_signed, it must match the PDA derivation
+  let seeds = &[b"vault", &[bump_seed]];
+
+  // Construct a token program transfer instruction to send tokens from vault to user.
+  let transfer_ix = spl_token::instruction::transfer(
+    token_program.key,
+    vault_token_account.key,                          // Vault_token_account = source which is the vault's token holding account
+    user_destination_token_account.key,               // User_destination_token_account which is user's receiving account
+    &vault_authority,                                 // Vault_authority = the signer (PDA that owns the vault_token_account). Authority is a PDA, so needs invoke_signed
+    &[],                                              // No additional signers needed for now
+    amount,
+  )?;
+
+  // Execute the token transfer with PDA signing via invoke_signed.
+  invoke_signed(
+    &transfer_ix,
+    &[
+      vault_token_account.clone(),
+      user_destination_token_account.clone(),
+      token_program.clone(),
+    ],
+   &[seeds],                                    // Signer seeds used to authorize PDA
+  )?;
+
+  // Log a message for off-chain indexing or debugging.
+  msg!("{} tokens withdrawn by {}", amount, user.key);
+
+  Ok(())
+}
